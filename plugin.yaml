@@ -1,0 +1,28 @@
+name: context-engine
+label: Context Engine (cache-stable)
+kind: standalone
+version: 0.1.0
+description: >
+  Cache-stable context engine for Hermes Agent (magic-context lineage, memory-less).
+  Tags recyclable units (tool results, file parts) with durable §N§ markers, lets the
+  model queue drops via ctx_reduce (stamping is queued, never destructive, originals
+  stay retrievable via ctx_expand), lands drops only on cache-busting passes so the
+  provider prompt cache prefix stays byte-stable, adds frozen `<!-- +Xm -->` time
+  markers, and serves as the emergency compress() lane for provider overflow /
+  gateway hygiene / manual /compress. All cross-pass state lives in
+  $HERMES_HOME/context-engine/context.db. Enable with `context.engine: context-engine`.
+author: rays1d
+homepage: https://github.com/rays1d/hermes-context-engine
+optional_env:
+  - name: HCE_ENABLED
+    description: "Master switch (default true). Disabling requires a restart so mid-session bytes never change."
+    prompt: "Enable the context engine (default true)"
+    password: false
+  - name: HCE_CACHE_TTL
+    description: "How long the engine believes the provider cache stays warm, in seconds or 5m/1h style (default 300 = 5m). Rebuilds ride idle gaps past this age; set `never` only with an external keep-warm proxy."
+    prompt: "Provider cache TTL (default 5m)"
+    password: false
+  - name: HCE_EXECUTE_THRESHOLD
+    description: "Usage percentage that permits a cache-busting rebuild (default 65)."
+    prompt: "Execute threshold percent (default 65)"
+    password: false
