@@ -26,3 +26,7 @@ optional_env:
     description: "Usage percentage that permits a cache-busting rebuild (default 65)."
     prompt: "Execute threshold percent (default 65)"
     password: false
+  - name: HCE_ESTIMATE_RATIO
+    description: "Static provider-tokens-per-estimated-unit ratio, frozen once per session (default 1.0). Raise it when a model's tokenizer systematically counts more than this heuristic estimator, so the protected tail is larger in real tokens; never learned at runtime."
+    prompt: "Estimate ratio (default 1.0)"
+    password: false

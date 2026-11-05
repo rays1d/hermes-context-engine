@@ -1,8 +1,10 @@
 """Single token estimator for HCE (design 9.13: one function, results persisted).
 
-Heuristic character-class estimator with a per-session calibration factor that is
-refined against the provider's real ``prompt_tokens`` (update_from_response). All
-lanes share this estimator; the render path never re-tokenizes (unit counts are
+Heuristic character-class estimator. Its systematic drift against a given model's
+real tokenizer is handled by ONE static ratio frozen per session (engine
+``_estimate_ratio``, default 1.0 = trust the heuristic) — never learned from
+``prompt_tokens``, which also prices the system prompt and tool schemas.
+All lanes share this estimator; the render path never re-tokenizes (unit counts are
 persisted at tag time and only read back).
 """
 
@@ -17,7 +19,8 @@ from typing import Any
 # to images too; a flat constant keeps our sums stable across passes).
 IMAGE_PART_TOKENS = 1500
 # ASCII-heavy text averages ~3.8 chars/token across modern tokenizers; CJK averages
-# close to 1 token/char. The calibration factor absorbs systematic drift.
+# close to 1 token/char. Any systematic drift is corrected by the engine's frozen
+# per-session ratio, not here — this function stays deterministic and stateless.
 ASCII_CHARS_PER_TOKEN = 3.8
 _TOOL_CALL_OVERHEAD_TOKENS = 8
 

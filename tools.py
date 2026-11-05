@@ -18,9 +18,9 @@ CTX_REDUCE_SCHEMA = {
         "Stamp context tags so their content leaves your working context. This is NOT "
         "deletion: stamping QUEUES the tag — the content drops out of the request at a "
         "later turn boundary, and the original stays retrievable via ctx_expand at any "
-        "time. Extra calls cost nothing, so use it liberally to keep the context lean: "
-        "old tool outputs, big file dumps, anything you no longer need verbatim. "
-        "Tag ids are the §N§ markers shown on tool results and file parts."
+        "time. Look at each tag before stamping; many small targeted stamps beat one "
+        "sweep, and never blanket-stamp a wide range. Tag ids are the §N§ markers shown "
+        "on tool results and file parts."
     ),
     "parameters": {
         "type": "object",

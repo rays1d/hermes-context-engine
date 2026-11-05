@@ -30,7 +30,9 @@ from .units import FILE_PART_TYPES, ScanResult, Unit
 
 PLACEHOLDER = "[dropped §{n}§]"
 TAG_PREFIX = "§{n}§"
-MARKER_FORMAT = "<!-- +{minutes}m -->"
+# Below this gap no marker is emitted at all: a 0m/1m marker on every quick exchange
+# is pure noise (and pure tokens). Matches magic-context's temporal threshold.
+MARKER_MIN_GAP_SECONDS = 300.0
 MAX_TOLERATED_CONTENT_DRIFT = 3
 
 
@@ -90,14 +92,25 @@ def _same_call_ids(req_calls: Any, conv_calls: Any) -> bool:
 
 
 def marker_text_for(gap_seconds: Optional[float]) -> str:
-    """Deterministic marker text; empty string when no gap is computable.
+    """Deterministic elapsed-time marker, or empty string when nothing is emitted.
 
-    The DECISION is frozen at the message's first appearance — an empty marker is
-    a decision too (design: 变更判定冻结). Never defer it to a later pass.
+    Coarse buckets (m/h/d/w) keep the byte shape stable while still conveying scale.
+    The DECISION is frozen at the message's first appearance — an empty marker is a
+    decision too (design: 变更判定冻结). Never defer it to a later pass.
     """
-    if gap_seconds is None or gap_seconds < 0:
+    if gap_seconds is None or gap_seconds < MARKER_MIN_GAP_SECONDS:
         return ""
-    return MARKER_FORMAT.format(minutes=int(gap_seconds // 60))
+    total = int(gap_seconds)
+    if total < 3600:
+        return f"<!-- +{total // 60}m -->"
+    if total < 86400:
+        hours, minutes = total // 3600, (total % 3600) // 60
+        return f"<!-- +{hours}h -->" if minutes == 0 else f"<!-- +{hours}h {minutes}m -->"
+    if total < 7 * 86400:
+        days, hours = total // 86400, (total % 86400) // 3600
+        return f"<!-- +{days}d -->" if hours == 0 else f"<!-- +{days}d {hours}h -->"
+    weeks, days = total // (7 * 86400), (total % (7 * 86400)) // 86400
+    return f"<!-- +{weeks}w -->" if days == 0 else f"<!-- +{weeks}w {days}d -->"
 
 
 def derive_content(
@@ -217,7 +230,7 @@ def render_request(
             if frozen is not None:
                 marker_text = frozen or None
             else:
-                anchor_ts = _previous_assistant_timestamp(scan, i)
+                anchor_ts = _previous_timestamp(scan, i)
                 user_ts = scan.timestamps[i]
                 gap = user_ts - anchor_ts if (anchor_ts is not None and user_ts is not None) else None
                 text = marker_text_for(gap)
@@ -308,8 +321,14 @@ def _is_removed(
     return bool(row and row.get("status") == "dropped" and row.get("drop_form") == "remove")
 
 
-def _previous_assistant_timestamp(scan: ScanResult, index: int) -> Optional[float]:
+def _previous_timestamp(scan: ScanResult, index: int) -> Optional[float]:
+    """Timestamp of the immediately preceding message (any role).
+
+    The previous message — not the previous *assistant* reply — is the right right-hand
+    endpoint: it is when the user last saw something happen, so tool round-trips in
+    between are counted in the elapsed gap instead of being silently excluded.
+    """
     for j in range(index - 1, -1, -1):
-        if scan.roles[j] == "assistant":
+        if scan.timestamps[j] is not None:
             return scan.timestamps[j]
     return None

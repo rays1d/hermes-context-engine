@@ -171,7 +171,8 @@ def test_remove_form_for_large_args_arc(make_engine):
         i for i, m in enumerate(conversation) if m.get("role") == "assistant"
         and any(c.get("id") == target_call_id for c in m.get("tool_calls", []))
     )
-    owner = landed[owner_index]
+    head_len = len(landed) - len(conversation)          # system/prefill rows
+    owner = landed[owner_index + head_len]
     assert not owner.get("tool_calls"), "big-args call must be stripped from its owner"
     assert owner["content"], "owner keeps its text and therefore its row"
 
@@ -195,19 +196,28 @@ def test_tag_prefix_visible_on_active_results(make_engine):
 
 def test_time_markers_frozen_and_replayed(make_engine):
     engine = make_engine()
-    counter = Counter()
     conversation: list[dict] = []
-    conversation.extend(counter.turn())
-    conversation.extend(counter.turn())
+    # 10-minute gaps: above the 5-minute marker threshold.
+    conversation.extend(make_turn(0, start_ts=1_700_000_000.0))
+    conversation.extend(make_turn(1, start_ts=1_700_000_600.0))
     first = run_pass(engine, conversation)
     user_texts = [m["content"] for m in first if m.get("role") == "user"]
-    # turn 0's user message has no anchor -> empty decision; turn 1's gap is 90s.
+    # First message has no predecessor -> no marker; second sees a ~9.5min gap.
     assert user_texts[0] == "task 0"
-    assert user_texts[1].startswith("<!-- +1m -->\n")
-    conversation.extend(counter.turn())
+    assert user_texts[1].startswith("<!-- +9m -->\n")
+    conversation.extend(make_turn(2, start_ts=1_700_001_200.0))
     second = run_pass(engine, conversation)
     # Frozen markers replay byte-exact on later passes.
     assert [m["content"] for m in second if m.get("role") == "user"][:2] == user_texts
+
+
+def test_short_gaps_get_no_marker(make_engine):
+    engine = make_engine()
+    conversation: list[dict] = []
+    conversation.extend(make_turn(0))
+    conversation.extend(make_turn(1))  # host_sim default gap is 120s < 5min
+    out = run_pass(engine, conversation)
+    assert [m["content"] for m in out if m.get("role") == "user"] == ["task 0", "task 1"]
 
 
 def test_held_drop_stays_queued_until_exposed(make_engine):
@@ -277,3 +287,108 @@ def test_pass_failure_falls_back_to_lkg(make_engine, monkeypatch):
     )
     assert replayed is not None
     assert fingerprint_list(replayed) == fingerprint_list(good)
+
+
+def test_third_held_pass_spends_the_bust(make_engine):
+    """连续第 3 趟挂住就放行：小会话永远到不了 2% 门槛，否则盖章永不落地。"""
+    engine = make_engine()                      # 200k window => 2% gate = 4k tokens
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(3):
+        conversation.extend(counter.turn())
+    conversation.extend(counter.big())
+    conversation.extend(counter.turn())
+    engine.update_from_response({"prompt_tokens": 20_000})
+    out = run_pass(engine, conversation)
+    small_tag = find_tag_for(out, "data")       # a tiny result, far below the gate
+    payload = json.loads(engine.handle_tool_call(
+        "ctx_reduce", {"tags": str(small_tag)}, messages=conversation
+    ))
+    assert payload["stamped"] == [small_tag]
+
+    landed_on = None
+    for pass_no in range(2, 6):
+        engine.update_from_response({"prompt_tokens": 21_000})
+        current = run_pass(engine, conversation)
+        if PLACEHOLDER.format(n=small_tag) in [m.get("content") for m in current]:
+            landed_on = pass_no
+            break
+    assert landed_on is not None, "held drops must eventually land"
+    assert landed_on <= 4, landed_on            # 3 consecutive held passes, then a bust
+
+
+def test_newest_tool_arcs_always_visible(make_engine):
+    """结构性最小量：最新 3 个工具弧不被自动回收（窗口再大也一样）。"""
+    engine = make_engine(context_length=1_000_000)
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(4):
+        conversation.extend(counter.turn())
+    engine.update_from_response({"prompt_tokens": 1_000})
+    out = run_pass(engine, conversation)
+    newest_three = [find_tag_for(out, "data")][:0]
+    tags = [int(m["content"].split(" ", 1)[0][1:-1]) for m in out if m.get("role") == "tool"]
+    for tag in tags[-3:]:
+        payload = json.loads(engine.handle_tool_call(
+            "ctx_reduce", {"tags": str(tag)}, messages=conversation
+        ))
+        assert payload["held"] == [tag], (tag, payload)
+
+
+def test_remove_downgrades_when_owner_would_empty(make_engine):
+    """大参数弧本该整体移除；但若 owner 没了调用就只剩空壳，降级为骨架。"""
+    engine = make_engine(context_length=200_000)
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(2):
+        conversation.extend(counter.turn())
+    big_args = json.dumps({"path": "/data/", "blob": "a" * 2000})
+    conversation.extend(counter.turn(assistant_text="", tool_args=big_args))  # empty shell
+    for _ in range(3):
+        conversation.extend(counter.turn())
+    conversation.extend(counter.big())
+    engine.update_from_response({"prompt_tokens": 140_000})
+    out = run_pass(engine, conversation)
+    target_call_id = next(
+        call["id"] for m in conversation if m.get("role") == "assistant"
+        for call in m.get("tool_calls", [])
+        if "blob" in call.get("function", {}).get("arguments", "")
+    )
+    target = next(m for m in out if m.get("role") == "tool"
+                  and m.get("tool_call_id") == target_call_id)
+    tag = int(target["content"].split(" ", 1)[0][1:-1])
+
+    engine.handle_tool_call("ctx_reduce", {"tags": str(tag)}, messages=conversation)
+    engine.update_from_response({"prompt_tokens": 141_000})
+    landed = run_pass(engine, conversation)
+    assert PLACEHOLDER.format(n=tag) in [m.get("content") for m in landed]
+    owner_index = next(
+        i for i, m in enumerate(conversation) if m.get("role") == "assistant"
+        and any(c.get("id") == target_call_id for c in m.get("tool_calls", []))
+    )
+    head_len = len(landed) - len(conversation)
+    assert landed[owner_index + head_len].get("tool_calls"), "call must survive as a skeleton"
+
+
+def test_lkg_dropped_when_model_changed(make_engine, monkeypatch):
+    """快照跨模型不可重放：模型变了就丢掉快照（不是硬着头皮回放旧字节）。"""
+    engine = make_engine()
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(3):
+        conversation.extend(counter.turn())
+    engine.update_from_response({"prompt_tokens": 12_000})
+    good = run_pass(engine, conversation)
+    assert engine._store.load_lkg(engine._session_id) is not None
+
+    import hce_plugin.engine as engine_module
+
+    def boom(*_a, **_k):
+        raise RuntimeError("simulated internal failure")
+
+    engine.update_model("other-model", engine.context_length)
+    monkeypatch.setattr(engine_module, "scan_conversation", boom)
+    assert engine.select_context(
+        build_request(conversation), conversation_messages=conversation, budget_tokens=0
+    ) is None, "stale-model snapshot must not be replayed"
+    assert engine._store.load_lkg(engine._session_id) is None

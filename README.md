@@ -40,6 +40,7 @@ context:
 | `HCE_ENABLED` | `true` | 总开关。关闭需重启生效（会话中途永不改字节） |
 | `HCE_CACHE_TTL` | `300`（5m） | 引擎认为 provider 缓存存活的时长（秒，或 `5m`/`1h`，`never` 关闭空闲触发）。仅当有外部 keep-warm 保活时才设 `never` |
 | `HCE_EXECUTE_THRESHOLD` | `65` | 允许重建的用量百分比 |
+| `HCE_ESTIMATE_RATIO` | `1.0` | token 估算的静态比例（provider 侧每 1 个“估算单位”对应多少真实 token），**每会话冻结一次**。模型的分词器系统性多于启发式估算时调大（保护尾巴更长），反之调小。不从真实用量学习——`prompt_tokens` 含系统提示与工具 schemas，拿它学会把固定开销当成漂移 |
 
 行为性常量（保护窗口、骨架阈值 1024 字节、最新 20 次调用等）**刻意不暴露**——见设计文档第七部分。
 

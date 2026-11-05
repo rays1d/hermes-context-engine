@@ -30,8 +30,10 @@ logger = logging.getLogger("hermes.context_engine")
 
 SMALL_ARGS_BYTES = 1024          # design 3.2 骨架"小输入"阈值（全车道共享同一函数）
 RECENT_CALL_WINDOW = 20          # 最新 N 次工具调用
+STRUCTURAL_TOOL_MINIMUM = 3      # 最新 N 个工具弧永远保留（眼睛里得有工具调用长什么样）
 PROTECTED_TOOL_KEEP = {"ctx_reduce": 3}   # todo_list 探测留待后续里程碑
-QUEUE_REBUILD_FRACTION = 0.02    # 自行重建门槛：排队 ≥ 2% usable
+QUEUE_REBUILD_FRACTION = 0.02    # 自行重建门槛：排队 ≥ 2% **原始窗口**
+HELD_PASS_LIMIT = 3              # 连续第 N 趟被挂住也放行（否则小会话永远等不到 2%）
 PROTECTION_FRACTION = 0.05
 PROTECTION_FLOOR_FRAC = 0.08
 PROTECTION_FLOOR_ABS = 16_000
@@ -164,27 +166,31 @@ class HermesContextEngine(ContextEngine):
     ) -> None:
         """HCE owns its threshold policy outright (no per-model override table): the
         host-resolved context_length is the only input that matters here."""
+        self.model = str(model or "")
         self.context_length = int(context_length or 0)
         self.threshold_percent = self._threshold_pct / 100.0
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
+        """Track provider token counters for status only.
+
+        Deliberately NO runtime estimate calibration: the estimator's drift is handled
+        by a single static ratio frozen per session (``_estimate_ratio``). Learning a
+        ratio from ``prompt_tokens`` would mix classes — that counter prices the whole
+        request (system prompt + tool schemas + messages) while our estimate covers
+        messages only, so the fixed overhead lands in the ratio as fake drift.
+        """
         prompt = int((usage or {}).get("prompt_tokens") or 0)
         self.last_prompt_tokens = prompt
         self.last_completion_tokens = int((usage or {}).get("completion_tokens") or 0)
         self.last_total_tokens = int((usage or {}).get("total_tokens") or 0)
         store = self._store
-        if store is None or not self._session_id:
+        if store is None or not self._session_id or prompt <= 0:
             return
         try:
-            est = store.get_meta(self._session_id, "last_est_total", 0)
-            if est and prompt > 0 and self.context_length:
-                raw = _clamp(prompt / float(est), MIN_RATIO, MAX_RATIO)
-                old = store.get_meta(self._session_id, "calibration", 1.0)
-                store.write_meta(self._session_id, "calibration", round(0.8 * old + 0.2 * raw, 6))
             store.write_meta(self._session_id, "last_prompt_tokens", prompt)
         except Exception:
-            logger.debug("HCE calibration update failed", exc_info=True)
+            logger.debug("HCE usage persist failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # host-driven compaction policy
@@ -235,12 +241,17 @@ class HermesContextEngine(ContextEngine):
                 )
                 protected = self._protected_tag_numbers(conn, scan, unit_tag_numbers)
                 pending = store.load_pending(conn, sid)
-                queued_tokens = sum(
-                    self._tag_token(tag_rows, int(p["tag_number"]))
-                    for p in pending
-                    if int(p["tag_number"]) not in protected
+                queued_tokens = 0
+                queued_count = 0
+                for p in pending:
+                    number = int(p["tag_number"])
+                    if number in protected:
+                        continue
+                    queued_tokens += self._tag_token(tag_rows, number)
+                    queued_count += 1
+                reasons = self._rebuild_reasons(
+                    conn, now, queued_tokens, queued_count, changed
                 )
-                reasons = self._rebuild_reasons(conn, now, queued_tokens, changed)
                 if reasons:
                     self._land_pending(
                         conn, conversation_messages, scan, unit_tag_numbers, tag_rows,
@@ -266,10 +277,10 @@ class HermesContextEngine(ContextEngine):
             return self._lkg_replay(request_messages)
 
     def _rebuild_reasons(
-        self, conn: Any, now: float, queued_tokens: int, changed: bool,
+        self, conn: Any, now: float, queued_tokens: int, queued_count: int, changed: bool,
     ) -> list[str]:
-        """重建许可：每趟 pass 算一次，所有车道共享（不变式 5）。M0 触发器只有
-        执行阈值与空闲超时，外加排队压力与对账变更两个落地时机。"""
+        """重建许可：每趟 pass 算一次，所有车道共享（不变式 5）。M0 触发器：
+        执行阈值、空闲超时、排队量占原始窗口 2%、连续第 3 趟挂住、对账变更。"""
         sid = self._session_id or ""
         store = self._store
         assert store is not None
@@ -285,14 +296,22 @@ class HermesContextEngine(ContextEngine):
             last_req = store.get_meta_in_tx(conn, sid, "last_request_at", None)
             if last_req and (now - float(last_req)) >= self._cache_ttl:
                 reasons.append("idle")
-        usable = ctx_len * (self._threshold_pct / 100.0)
-        if usable > 0 and queued_tokens > 0:
-            ratio = self._calibration(conn)
-            if queued_tokens * ratio >= max(QUEUE_REBUILD_FRACTION * usable, 1.0):
+        if queued_tokens > 0 and ctx_len > 0:
+            ratio = self._estimate_ratio(conn)
+            # 2% of the RAW window (not of usable): the gate is about "is this worth a
+            # bust", and a bigger window should need a bigger pile to justify one.
+            if queued_tokens * ratio >= max(QUEUE_REBUILD_FRACTION * ctx_len, 1.0):
                 reasons.append("queue")
+        if queued_count > 0 and not reasons:
+            held = int(store.get_meta_in_tx(conn, sid, "held_passes", 0) or 0) + 1
+            store.set_meta(conn, sid, "held_passes", held)
+            if held >= HELD_PASS_LIMIT:
+                reasons.append(f"held({held})")
         if changed:
+            # Compaction removed a tag that used to be on the wire: past bytes must change.
             reasons.append("reconcile")
         if reasons:
+            store.set_meta(conn, sid, "held_passes", 0)
             logger.info("HCE rebuild permitted: %s (session=%s)", ",".join(reasons), sid)
         return reasons
 
@@ -445,7 +464,7 @@ class HermesContextEngine(ContextEngine):
                 continue  # held: accepted earlier, lands once it leaves the window
             form = row.get("drop_form") or "skeleton"
             unit = number_to_unit.get(number)
-            if form == "remove" and (unit is None or self._removal_unsafe(unit)):
+            if form == "remove" and (unit is None or self._removal_unsafe(unit, conversation)):
                 form = "skeleton"  # land-time safety downgrade (design 3.2 三条例外)
             payload = self._source_payload(conversation, unit)
             if payload is not None:
@@ -460,8 +479,33 @@ class HermesContextEngine(ContextEngine):
             landed = True
         return landed
 
-    def _removal_unsafe(self, unit: Unit) -> bool:
-        return unit.kind == "tool" and (unit.result_is_last or unit.owner_has_reasoning)
+    def _removal_unsafe(self, unit: Unit, conversation: list[dict[str, Any]]) -> bool:
+        """Forms that must degrade to a skeleton at land time.
+
+        Removing a call whose result is the request tail, or that carries signed
+        reasoning, or whose owner would be emptied (leaving a text-less assistant row
+        or two assistant rows adjacent — the exact shape behind shipped provider 400s),
+        keeps the call with its REAL arguments instead.
+        """
+        if unit.kind != "tool":
+            return False
+        if unit.result_is_last or unit.owner_has_reasoning:
+            return True
+        return self._owner_would_empty(conversation, unit)
+
+    def _owner_would_empty(
+        self, conversation: list[dict[str, Any]], unit: Unit,
+    ) -> bool:
+        if unit.owner_index is None or unit.owner_index >= len(conversation):
+            return False
+        owner = conversation[unit.owner_index]
+        if not isinstance(owner, dict):
+            return False
+        content = owner.get("content")
+        has_text = bool(content) and not (isinstance(content, str) and not content.strip())
+        calls = owner.get("tool_calls")
+        call_count = len(calls) if isinstance(calls, list) else 0
+        return not has_text and call_count <= 1
 
     def _compact_inner_files(
         self, conn: Any, conversation: list[dict[str, Any]], scan: Any,
@@ -522,15 +566,29 @@ class HermesContextEngine(ContextEngine):
     # protection window
     # ------------------------------------------------------------------
 
-    def _calibration(self, conn: Any) -> float:
+    def _estimate_ratio(self, conn: Any) -> float:
+        """Provider-tokens-per-estimated-unit, FROZEN once per session.
+
+        Deliberately static: the estimator is a deterministic char-class heuristic and
+        its systematic drift does not change mid-session, so learning it per turn only
+        adds state that can wander. Resolved once (session_meta) from
+        ``HCE_ESTIMATE_RATIO`` (default 1.0 = trust the heuristic), clamped to sane
+        bounds. Raise it when a model's tokenizer systematically yields more provider
+        tokens than this heuristic counts — that makes the engine protect a LARGER real
+        tail; lower it only when over-protection is measurably wasteful.
+        """
         sid = self._session_id or ""
         if conn is None or self._store is None:
             return 1.0
-        value = self._store.get_meta_in_tx(conn, sid, "calibration", 1.0)
-        try:
-            return _clamp(float(value), MIN_RATIO, MAX_RATIO)
-        except (TypeError, ValueError):
-            return 1.0
+        frozen = self._store.get_meta_in_tx(conn, sid, "estimate_ratio", None)
+        if frozen is not None:
+            try:
+                return _clamp(float(frozen), MIN_RATIO, MAX_RATIO)
+            except (TypeError, ValueError):
+                return 1.0
+        ratio = _clamp(_env_float("HCE_ESTIMATE_RATIO", 1.0), MIN_RATIO, MAX_RATIO)
+        self._store.set_meta(conn, sid, "estimate_ratio", round(ratio, 6))
+        return ratio
 
     def _protected_tag_numbers(
         self, conn: Any, scan: Any, unit_tag_numbers: Optional[dict[tuple, int]] = None,
@@ -544,7 +602,7 @@ class HermesContextEngine(ContextEngine):
         if usable <= 0:
             span_start = len(scan.identities)  # no window math: structural protection only
         else:
-            ratio = self._calibration(conn)
+            ratio = self._estimate_ratio(conn)
             floor = min(PROTECTION_FLOOR_ABS, round(PROTECTION_FLOOR_FRAC * usable))
             target = _clamp(round(PROTECTION_FRACTION * usable), floor, PROTECTION_CEILING)
             target_units = target / ratio
@@ -561,7 +619,22 @@ class HermesContextEngine(ContextEngine):
             )
             if number is None:
                 continue
-            if unit.carrier_index >= span_start:
+            # Protection is per ARC, not per part: protecting a result while its owner
+            # assistant sits outside the window would strip the call and orphan the
+            # result (a shape some providers reject outright).
+            inside = unit.carrier_index >= span_start
+            if not inside and unit.owner_index is not None:
+                inside = unit.owner_index >= span_start
+            if inside:
+                protected.add(number)
+        # Structural minimum: the newest few tool arcs stay visible no matter where the
+        # token window lands, so the model never loses sight of what a tool call looks
+        # like (it starts inventing them otherwise).
+        for unit in tool_units[-STRUCTURAL_TOOL_MINIMUM:]:
+            number = unit_tag_numbers.get(
+                (unit.kind, unit.carrier_id, unit.call_id, unit.part_index)
+            )
+            if number is not None:
                 protected.add(number)
         reduce_calls = [u for u in tool_units if u.call_name in PROTECTED_TOOL_KEEP]
         for unit in reduce_calls[-PROTECTED_TOOL_KEEP["ctx_reduce"]:]:
@@ -613,6 +686,17 @@ class HermesContextEngine(ContextEngine):
                 return None
             record = self._store.load_lkg(self._session_id)
             if not record:
+                return None
+            # A snapshot rendered under a different model is not replayable: pricing and
+            # provider shapes differ. Mismatch ⇒ drop the slot rather than serve stale bytes.
+            snapshot_model = str(record.get("model") or "")
+            current_model = str(self.model or "")
+            if snapshot_model and current_model and snapshot_model != current_model:
+                logger.info(
+                    "HCE LKG dropped: model changed %s -> %s", snapshot_model, current_model
+                )
+                with self._store.transaction() as conn:
+                    conn.execute("DELETE FROM lkg WHERE session_id=?", (self._session_id,))
                 return None
             payload = json.loads(record["payload"])
             head_fps = json.loads(record["head_fps"])
@@ -692,7 +776,7 @@ class HermesContextEngine(ContextEngine):
         ctx_len = int(self.context_length or 0)
         if ctx_len <= 0:
             return sum(scan.token_estimates) // 2  # no window info: shed half
-        ratio = self._calibration(conn)
+        ratio = self._estimate_ratio(conn)
         return int(0.60 * ctx_len / max(ratio, MIN_RATIO))
 
     def _skeletonize_oldest(

@@ -113,8 +113,14 @@ def test_message_estimate_prices_parts_and_calls():
 
 
 def test_marker_text_format():
-    assert marker_text_for(90.0) == "<!-- +1m -->"
-    assert marker_text_for(0.0) == "<!-- +0m -->"
+    assert marker_text_for(90.0) == ""                    # < 5min: no marker at all
+    assert marker_text_for(299.0) == ""
+    assert marker_text_for(300.0) == "<!-- +5m -->"
+    assert marker_text_for(90 * 60.0) == "<!-- +1h 30m -->"
+    assert marker_text_for(2 * 3600.0) == "<!-- +2h -->"
+    assert marker_text_for(3 * 86400.0) == "<!-- +3d -->"
+    assert marker_text_for(86400.0 + 7200.0) == "<!-- +1d 2h -->"
+    assert marker_text_for(14 * 86400.0) == "<!-- +2w -->"
     assert marker_text_for(None) == ""
     assert marker_text_for(-3.0) == ""
 
@@ -136,3 +142,36 @@ def test_schema_fence_refuses_newer_database(make_engine, tmp_path):
     ) is None
     assert engine.compress(conversation) == conversation
     assert engine._store_failed is True
+
+
+def test_estimate_ratio_frozen_default_and_override(make_engine, monkeypatch):
+    """比值每会话冻结一次：默认 1.0，可用 HCE_ESTIMATE_RATIO 显式给，之后不再变。"""
+    from host_sim import build_request, make_turn
+
+    engine = make_engine(context_length=1_000_000)
+    conversation: list[dict] = []
+    for i in range(3):
+        conversation.extend(make_turn(i))
+    output = engine.select_context(
+        build_request(conversation), conversation_messages=conversation, budget_tokens=0
+    )
+    assert output is not None
+    assert engine._store.get_meta(engine._session_id, "estimate_ratio") == 1.0
+
+    # Provider usage must NOT rewrite the ratio (no runtime learning).
+    engine.update_from_response({"prompt_tokens": 16809})
+    assert engine._store.get_meta(engine._session_id, "estimate_ratio") == 1.0
+    assert engine.last_prompt_tokens == 16809
+
+    # An explicit env override applies to a FRESH session and then stays frozen,
+    # even after the env changes under a live session.
+    monkeypatch.setenv("HCE_ESTIMATE_RATIO", "1.6")
+    fresh = make_engine(session_id="s2", context_length=1_000_000)
+    fresh.select_context(
+        build_request(conversation), conversation_messages=conversation, budget_tokens=0
+    )
+    assert fresh._store.get_meta("s2", "estimate_ratio") == 1.6
+    monkeypatch.setenv("HCE_ESTIMATE_RATIO", "0.5")
+    assert fresh._estimate_ratio(None) == 1.0  # conn None -> neutral, never re-reads
+    with fresh._store.transaction() as conn:
+        assert fresh._estimate_ratio(conn) == 1.6
