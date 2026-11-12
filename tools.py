@@ -154,10 +154,16 @@ def reduce_response(
         )
     if unknown:
         names = ", ".join(f"§{n}§" for n in unknown)
-        parts.append(
-            f"Tag(s) {names} do not exist. Valid tags run §1§–§{max_tag}§; untagged content "
-            "has no marker and cannot be stamped."
-        )
+        if max_tag > 0:
+            parts.append(
+                f"Tag(s) {names} do not exist. Valid tags run §1§–§{max_tag}§; untagged "
+                "content has no marker and cannot be stamped."
+            )
+        else:
+            parts.append(
+                f"Tag(s) {names} do not exist — no tags have been created in this session "
+                "yet, so there is nothing to reclaim."
+            )
     if not parts:
         parts.append("Nothing to reclaim: no matching tags were given.")
     return json.dumps(

@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS frozen_markers (
   created_at  REAL NOT NULL,
   PRIMARY KEY (session_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS frozen_nudges (
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,               -- carrier identity that carries the reminder
+  text       TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (session_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS session_meta (
   session_id TEXT NOT NULL,
   key        TEXT NOT NULL,
@@ -358,6 +365,38 @@ class Store:
         marks = ",".join("?" for _ in ids)
         conn.execute(
             f"DELETE FROM frozen_markers WHERE session_id=? AND message_id IN ({marks})",
+            (session_id, *ids),
+        )
+
+    # -- frozen nudges ---------------------------------------------------------------
+
+    def freeze_nudge(self, conn: sqlite3.Connection, session_id: str,
+                     message_id: str, text: str) -> None:
+        import time as _time
+
+        conn.execute(
+            "INSERT OR REPLACE INTO frozen_nudges (session_id, message_id, text, created_at) "
+            "VALUES (?,?,?,?)",
+            (session_id, message_id, text, _time.time()),
+        )
+
+    def load_nudges(self, conn: sqlite3.Connection, session_id: str) -> dict[str, str]:
+        rows = conn.execute(
+            "SELECT message_id, text FROM frozen_nudges WHERE session_id=?", (session_id,)
+        ).fetchall()
+        return {r["message_id"]: r["text"] for r in rows}
+
+    def clear_nudges(self, conn: sqlite3.Connection, session_id: str) -> None:
+        conn.execute("DELETE FROM frozen_nudges WHERE session_id=?", (session_id,))
+
+    def drop_nudges(self, conn: sqlite3.Connection, session_id: str,
+                    message_ids: Iterable[str]) -> None:
+        ids = list(message_ids)
+        if not ids:
+            return
+        marks = ",".join("?" for _ in ids)
+        conn.execute(
+            f"DELETE FROM frozen_nudges WHERE session_id=? AND message_id IN ({marks})",
             (session_id, *ids),
         )
 

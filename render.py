@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .nudge import NUDGE_OPEN, strip_reminders
 from .units import FILE_PART_TYPES, ScanResult, Unit
 
 PLACEHOLDER = "[dropped §{n}§]"
@@ -89,6 +90,28 @@ def _same_call_ids(req_calls: Any, conv_calls: Any) -> bool:
     if req_ids is None or conv_ids is None:
         return req_ids == conv_ids
     return req_ids == conv_ids
+
+
+def _append_text(content: Any, text: str) -> Any:
+    """Append a block to string or parts-list content."""
+    if isinstance(content, list):
+        return list(content) + [{"type": "text", "text": text}]
+    base = content if isinstance(content, str) else ("" if content is None else str(content))
+    return f"{base}\n\n{text}" if base else text
+
+
+def _strip_from_parts(content: Any) -> Any:
+    if not isinstance(content, list) or NUDGE_OPEN not in repr(content):
+        return content
+    cleaned: list[Any] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+            text = strip_reminders(part["text"])
+            if text.strip():
+                cleaned.append({**part, "text": text})
+            continue
+        cleaned.append(part)
+    return cleaned
 
 
 def marker_text_for(gap_seconds: Optional[float]) -> str:
@@ -174,6 +197,9 @@ def render_request(
     include_markers: bool = True,
     prefix_active: bool = True,
     skip_verification: bool = False,
+    nudge: Optional[str] = None,
+    frozen_nudges: Optional[dict[str, str]] = None,
+    strip_stale_reminders: bool = False,
 ) -> tuple[list[Any], list[tuple[str, str]], int]:
     """Render the request copy. Returns ``(output, new_markers, head_len)``.
 
@@ -222,7 +248,25 @@ def render_request(
         if not isinstance(base_req, dict):  # verified earlier; keep the type checker honest
             continue
         base_content = base_req.get("content")
+        if strip_stale_reminders and (
+            (isinstance(base_content, str) and NUDGE_OPEN in base_content)
+            or isinstance(base_content, list)
+        ):
+            # Stale reminders may only be rewritten on passes that were going to change
+            # historical bytes anyway; a derived pass replays them verbatim.
+            base_content = (
+                strip_reminders(base_content) if isinstance(base_content, str)
+                else _strip_from_parts(base_content)
+            )
         identity = scan.identities[i]
+
+        # Reminders already frozen onto this message replay byte-exact; a message that
+        # was the tail when it got one must keep it after the tail moves past it.
+        frozen_nudge = (frozen_nudges or {}).get(identity)
+        content_touched = False
+        if frozen_nudge:
+            base_content = _append_text(base_content, frozen_nudge)
+            content_touched = True
 
         marker_text: Optional[str] = None
         if role == "user" and include_markers:
@@ -266,7 +310,7 @@ def render_request(
             placeholder_n=placeholder_n, file_ops=file_ops or None,
             prefix_active=prefix_active,
         )
-        if derived is not base_content:
+        if content_touched or derived is not base_content:
             copy = dict(base_req)
             copy["content"] = derived
             out[req_index] = copy
@@ -308,6 +352,15 @@ def render_request(
     for req_index in sorted(request_removals | emptied_owners, reverse=True):
         if 0 <= req_index < len(out):
             del out[req_index]
+
+    if nudge:
+        # Tail-only: the reminder rides the newest user message, so it can never move a
+        # cached prefix. Frozen history keeps whatever it had until a rebuild strips it.
+        for rev in range(len(out) - 1, -1, -1):
+            msg = out[rev]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                out[rev] = {**msg, "content": _append_text(msg.get("content"), nudge)}
+                break
     return out, new_markers, head_len
 
 

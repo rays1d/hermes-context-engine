@@ -21,6 +21,7 @@ from typing import Any, Optional
 from agent.context_engine import ContextEngine
 
 from .estimate import content_fingerprint, estimate_message_tokens
+from .nudge import decide as nudge_decide
 from .render import PLACEHOLDER, RenderMismatch, render_request
 from .store import SchemaFenceError, Store
 from .tools import expand_response, parse_tag_ids, reduce_response, tool_schemas
@@ -82,6 +83,14 @@ def _env_duration(key: str, default: Optional[float]) -> Optional[float]:
             pass
     logger.warning("HCE config %s=%r is not a duration; using default %s", key, raw, default)
     return default
+
+
+def _last_user_identity(scan: Any) -> Optional[str]:
+    """Identity of the newest user message (the only place a fresh reminder may ride)."""
+    for i in range(len(scan.roles) - 1, -1, -1):
+        if scan.roles[i] == "user" and scan.identities[i]:
+            return scan.identities[i]
+    return None
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -159,6 +168,28 @@ class HermesContextEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._session_id = None
+
+    def _bump(self, conn: Any, key: str, by: int = 1) -> None:
+        """Per-session counter in ``session_meta`` (cheap: same pass transaction)."""
+        store, sid = self._store, self._session_id
+        if store is None or not sid:
+            return
+        try:
+            current = int(store.get_meta_in_tx(conn, sid, key, 0) or 0)
+            store.set_meta(conn, sid, key, current + by)
+        except Exception:
+            logger.debug("HCE counter %s failed", key, exc_info=True)
+
+    def _bump_safe(self, key: str, by: int = 1) -> None:
+        """Counter bump outside a pass transaction (failure paths)."""
+        store = self._store
+        if store is None or not self._session_id:
+            return
+        try:
+            with store.transaction() as conn:
+                self._bump(conn, key, by)
+        except Exception:
+            logger.debug("HCE counter %s failed outside txn", key, exc_info=True)
 
     def update_model(
         self, model: str, context_length: int, base_url: str = "", api_key: str = "",
@@ -252,29 +283,57 @@ class HermesContextEngine(ContextEngine):
                 reasons = self._rebuild_reasons(
                     conn, now, queued_tokens, queued_count, changed
                 )
+                landed = False
                 if reasons:
-                    self._land_pending(
+                    landed = self._land_pending(
                         conn, conversation_messages, scan, unit_tag_numbers, tag_rows,
                         pending, protected, now,
                     )
+                nudge_text = self._nudge_for_pass(
+                    conn, scan, unit_tag_numbers, tag_rows, protected, landed
+                )
                 markers = store.load_markers(conn, sid)
+                if reasons:
+                    # A rebuilding pass may rewrite history: retire every stale reminder
+                    # instead of replaying them, then let this pass decide a fresh one.
+                    store.clear_nudges(conn, sid)
+                    frozen_nudges: dict[str, str] = {}
+                else:
+                    frozen_nudges = store.load_nudges(conn, sid)
                 output, new_markers, head_len = render_request(
                     request_messages, conversation_messages, scan,
                     unit_tag_numbers, tag_rows, markers,
+                    nudge=nudge_text, frozen_nudges=frozen_nudges,
+                    strip_stale_reminders=bool(reasons),
                 )
+                if nudge_text:
+                    # Freeze immediately: once the tail moves past this message it must
+                    # replay the exact same reminder bytes.
+                    target = _last_user_identity(scan)
+                    if target is not None:
+                        store.freeze_nudge(conn, sid, target, nudge_text)
                 for identity, text in new_markers:
                     store.freeze_marker(conn, sid, identity, text)
                 est_total = sum(estimate_message_tokens(m) for m in output)
                 store.set_meta(conn, sid, "last_est_total", int(est_total))
                 store.set_meta(conn, sid, "last_request_at", now)
+                self._bump(conn, "passes")
+                if reasons:
+                    self._bump(conn, "rebuilds")
+                    self._bump(conn, "rebuild:" + reasons[0].split("(")[0])
                 self._update_lkg(conn, output, head_len, scan)
             return output
         except RenderMismatch as exc:
             logger.warning("HCE mapping failed; sending unmodified request (%s)", exc)
+            self._bump_safe("failopens")
             return None
         except Exception:
             logger.warning("HCE pass failed; attempting LKG replay", exc_info=True)
-            return self._lkg_replay(request_messages)
+            self._bump_safe("failopens")
+            replayed = self._lkg_replay(request_messages)
+            if replayed is not None:
+                self._bump_safe("lkg_replays")
+            return replayed
 
     def _rebuild_reasons(
         self, conn: Any, now: float, queued_tokens: int, queued_count: int, changed: bool,
@@ -385,6 +444,10 @@ class HermesContextEngine(ContextEngine):
             if stale:
                 store.drop_markers(conn, sid, stale)
                 changed = True
+            stale_nudges = [mid for mid in store.load_nudges(conn, sid) if mid not in live_ids]
+            if stale_nudges:
+                store.drop_nudges(conn, sid, stale_nudges)
+                changed = True
         return unit_tag_numbers, tag_rows, changed
 
     def _match_tag(
@@ -478,6 +541,54 @@ class HermesContextEngine(ContextEngine):
                 )
             landed = True
         return landed
+
+    def _nudge_for_pass(
+        self, conn: Any, scan: Any, unit_tag_numbers: dict[tuple, int],
+        tag_rows: dict[int, dict[str, Any]], protected: set[int], landed: bool,
+    ) -> Optional[str]:
+        """Decide whether a reduction reminder rides this pass (tail-only bytes)."""
+        store = self._store
+        sid = self._session_id or ""
+        if store is None or not sid:
+            return None
+        usable = int(self.context_length or 0) * (self._threshold_pct / 100.0)
+        count = 0
+        tokens = 0
+        oldest: list[tuple[int, Optional[str]]] = []
+        for unit in scan.units:
+            number = unit_tag_numbers.get(
+                (unit.kind, unit.carrier_id, unit.call_id, unit.part_index)
+            )
+            if number is None or number in protected:
+                continue
+            row = tag_rows.get(number)
+            if row is None or row.get("status") != "active":
+                continue
+            count += 1
+            tokens += int(row.get("token_count") or 0)
+            if len(oldest) < 4:
+                oldest.append((number, row.get("call_name")))
+        decision = nudge_decide(
+            reclaimable_tokens=tokens,
+            reclaimable_count=count,
+            usable=usable,
+            oldest=oldest,
+            last_fired_tokens=store.get_meta_in_tx(conn, sid, "nudge_fired_tokens", None),
+            last_level=store.get_meta_in_tx(conn, sid, "nudge_level", None),
+            just_landed=landed,
+        )
+        if decision is None:
+            return None
+        level, text = decision
+        store.set_meta(conn, sid, "nudge_fired_tokens", int(tokens))
+        store.set_meta(conn, sid, "nudge_level", level)
+        self._bump(conn, "nudges")
+        self._bump(conn, f"nudge_{level}")
+        logger.info(
+            "HCE nudge %s: %d outputs / %d tokens reclaimable (session=%s)",
+            level, count, tokens, sid,
+        )
+        return text
 
     def _removal_unsafe(self, unit: Unit, conversation: list[dict[str, Any]]) -> bool:
         """Forms that must degrade to a skeleton at land time.
@@ -763,6 +874,7 @@ class HermesContextEngine(ContextEngine):
                 )
                 if output != messages or landed or skeletonized:
                     self.compression_count = int(getattr(self, "compression_count", 0)) + 1
+                    self._bump(conn, "compressions")
                     logger.info(
                         "HCE compress: %d messages -> %d (session=%s)",
                         len(messages), len(output), sid,
@@ -893,6 +1005,11 @@ class HermesContextEngine(ContextEngine):
                     store.queue_drop(conn, sid, number, form, now)
                     (held if number in protected else stamped).append(number)
             max_tag = store.next_tag_number(conn, sid) - 1
+            self._bump(conn, "reduce_calls")
+            self._bump(conn, "reduce_stamped", len(stamped))
+            self._bump(conn, "reduce_held", len(held))
+            self._bump(conn, "reduce_already", len(already))
+            self._bump(conn, "reduce_refused", len(refused) + len(unknown))
         return reduce_response(stamped, held, already, skipped_self, refused, unknown, max_tag)
 
     def _match_existing(
@@ -952,9 +1069,15 @@ class HermesContextEngine(ContextEngine):
                 continue
             status = store.tag_status(sid, number)
             if status is None:
-                notes.append(
-                    f"Tag §{number}§ does not exist. Valid tags run §1§–§{max_tag}§."
-                )
+                if max_tag == 0:
+                    notes.append(
+                        f"Tag §{number}§ does not exist — no tags have been created in "
+                        "this session yet."
+                    )
+                else:
+                    notes.append(
+                        f"Tag §{number}§ does not exist. Valid tags run §1§–§{max_tag}§."
+                    )
             elif status == "active":
                 notes.append(
                     f"Tag §{number}§ is still live in the context; nothing was dropped yet."
@@ -964,6 +1087,10 @@ class HermesContextEngine(ContextEngine):
                     f"Tag §{number}§ left the transcript before being stamped; "
                     "no original is stored."
                 )
+        max_tag = store.max_tag_number(sid)
+        self._bump_safe("expand_calls")
+        if sections:
+            self._bump_safe("expand_hits", len(sections))
         return expand_response(sections, notes)
 
     def _format_source(self, source: dict[str, Any]) -> str:
