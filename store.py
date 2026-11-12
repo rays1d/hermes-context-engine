@@ -129,33 +129,41 @@ class Store:
             return conn
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
+        """Fence on an incompatible database, then make sure every table exists.
+
+        The DDL is idempotent (``IF NOT EXISTS``) and runs on EVERY open, so adding a
+        table in a later release is a no-op upgrade for existing databases instead of a
+        silent ``no such table`` at query time. Anything that changes an existing
+        column's meaning must bump ``SCHEMA_VERSION`` instead — the fence refuses rather
+        than migrate.
+        """
         with self._transaction(conn):
-            exists = conn.execute(
+            meta_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
-            ).fetchone()
-            if exists is None:
-                # executescript() would implicitly COMMIT and break the atomic fence;
-                # the DDL has no embedded semicolons, so split-and-execute is safe.
-                for statement in _SCHEMA.strip().split(";"):
-                    statement = statement.strip()
-                    if statement:
-                        conn.execute(statement)
+            ).fetchone() is not None
+            if meta_exists:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                if row is None:
+                    raise SchemaFenceError("meta table exists but has no schema_version row")
+                try:
+                    db_version = int(row["value"])
+                except (TypeError, ValueError):
+                    raise SchemaFenceError(f"corrupt schema_version row: {row['value']!r}")
+                if db_version != SCHEMA_VERSION:
+                    raise SchemaFenceError(
+                        f"context.db schema version {db_version} != supported {SCHEMA_VERSION}; "
+                        "refusing to open (rollback = restore from backup, not downgrade)"
+                    )
+            for statement in _SCHEMA.strip().split(";"):
+                statement = statement.strip()
+                if statement:
+                    conn.execute(statement)
+            if not meta_exists:
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
-                )
-                return
-            row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None:
-                raise SchemaFenceError("meta table exists but has no schema_version row")
-            try:
-                db_version = int(row["value"])
-            except (TypeError, ValueError):
-                raise SchemaFenceError(f"corrupt schema_version row: {row['value']!r}")
-            if db_version != SCHEMA_VERSION:
-                raise SchemaFenceError(
-                    f"context.db schema version {db_version} != supported {SCHEMA_VERSION}; "
-                    "refusing to open (rollback = restore from backup, not downgrade)"
                 )
 
     @contextmanager

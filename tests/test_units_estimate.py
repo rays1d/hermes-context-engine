@@ -175,3 +175,27 @@ def test_estimate_ratio_frozen_default_and_override(make_engine, monkeypatch):
     assert fresh._estimate_ratio(None) == 1.0  # conn None -> neutral, never re-reads
     with fresh._store.transaction() as conn:
         assert fresh._estimate_ratio(conn) == 1.6
+
+
+def test_new_tables_appear_on_existing_database(tmp_path):
+    """给已存在的库补新表：幂等 DDL 每次打开都跑，不能只在建新库时跑。"""
+    from hce_plugin.store import Store
+
+    path = tmp_path / "context-engine" / "context.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    first = Store(str(path))
+    first.close()
+
+    # Simulate a database created by an earlier release (no frozen_nudges table).
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE frozen_nudges")
+    conn.commit()
+    conn.close()
+
+    reopened = Store(str(path))
+    with reopened.transaction() as tx:
+        assert tx.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='frozen_nudges'"
+        ).fetchone() is not None
+        assert reopened.get_meta_in_tx(tx, "any", "schema_version_probe", None) is None
+    reopened.close()
