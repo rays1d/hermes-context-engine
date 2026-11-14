@@ -1,7 +1,7 @@
 name: context-engine
 label: Context Engine (cache-stable)
 kind: standalone
-version: 0.1.0
+version: 0.1.1
 description: >
   Cache-stable context engine for Hermes Agent (magic-context lineage, memory-less).
   Tags recyclable units (tool results, file parts) with durable §N§ markers, lets the
@@ -17,10 +17,6 @@ optional_env:
   - name: HCE_ENABLED
     description: "Master switch (default true). Disabling requires a restart so mid-session bytes never change."
     prompt: "Enable the context engine (default true)"
-    password: false
-  - name: HCE_CACHE_TTL
-    description: "How long the engine believes the provider cache stays warm, in seconds or 5m/1h style (default 300 = 5m). Rebuilds ride idle gaps past this age; set `never` only with an external keep-warm proxy."
-    prompt: "Provider cache TTL (default 5m)"
     password: false
   - name: HCE_EXECUTE_THRESHOLD
     description: "Usage percentage that permits a cache-busting rebuild (default 65)."

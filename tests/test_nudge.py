@@ -60,30 +60,31 @@ def test_levels_escalate_with_severity():
     assert "§7§ bash" in text and "12k" in text
 
 
-def test_decide_needs_floor_and_regrowth():
-    kwargs = dict(reclaimable_count=5, usable=200_000, oldest=[(1, "bash")],
-                  just_landed=False)
-    # below the 2% floor (4k) -> silent
-    assert decide(reclaimable_tokens=3_000, last_fired_tokens=None,
-                  last_level=None, **kwargs) is None
-    # above floor, first fire
-    first = decide(reclaimable_tokens=50_000, last_fired_tokens=None,
-                   last_level=None, **kwargs)
+def test_decide_needs_floors_and_regrowth():
+    kwargs = dict(reclaimable_count=5, oldest=[(1, "bash")], just_landed=False)
+    # 地板：可回收量或尾巴本身太小 → 任何比例都不提
+    assert decide(reclaimable_tokens=24_000, tail_tokens=60_000,
+                  last_fired_tokens=None, last_level=None, **kwargs) is None
+    assert decide(reclaimable_tokens=40_000, tail_tokens=59_000,
+                  last_fired_tokens=None, last_level=None, **kwargs) is None
+    # 尾巴的 25% → gentle
+    first = decide(reclaimable_tokens=50_000, tail_tokens=200_000,
+                   last_fired_tokens=None, last_level=None, **kwargs)
     assert first is not None and first[0] == "gentle"
-    # same band, tiny regrowth -> silent
-    assert decide(reclaimable_tokens=52_000, last_fired_tokens=50_000,
-                  last_level="gentle", **kwargs) is None
-    # same band, real regrowth (>= max(floor, 8%)) -> fires
-    assert decide(reclaimable_tokens=60_000, last_fired_tokens=50_000,
-                  last_level="gentle", **kwargs) is not None
-    # band escalation always fires
-    escalated = decide(reclaimable_tokens=100_000, last_fired_tokens=98_000,
-                       last_level="gentle", **kwargs)
+    # 同档没真实增长 → 沉默
+    assert decide(reclaimable_tokens=52_000, tail_tokens=200_000,
+                  last_fired_tokens=50_000, last_level="gentle", **kwargs) is None
+    # 同档真实增长（≥ max(25k, 8% 尾巴)）→ 提
+    assert decide(reclaimable_tokens=76_000, tail_tokens=200_000,
+                  last_fired_tokens=50_000, last_level="gentle", **kwargs) is not None
+    # 升档立即提
+    escalated = decide(reclaimable_tokens=100_000, tail_tokens=200_000,
+                       last_fired_tokens=98_000, last_level="gentle", **kwargs)
     assert escalated is not None and escalated[0] == "firm"
-    # the pass that lands drops never reminds
-    assert decide(reclaimable_tokens=200_000, last_fired_tokens=None,
-                  last_level=None, just_landed=True,
-                  reclaimable_count=5, usable=200_000, oldest=[(1, "bash")]) is None
+    # 刚落地内容的 pass 不提
+    assert decide(reclaimable_tokens=150_000, tail_tokens=200_000,
+                  last_fired_tokens=None, last_level=None, just_landed=True,
+                  reclaimable_count=5, oldest=[(1, "bash")]) is None
 
 
 # ── 端到端 ───────────────────────────────────────────────────────────────
@@ -135,8 +136,8 @@ def test_reminder_stripped_on_rebuild_pass(make_engine):
     assert all(NUDGE_OPEN not in str(text) for text in middle)
 
 
-def test_no_nudge_below_floor(make_engine):
-    engine = make_engine(context_length=1_000_000)   # 2% floor = 20k tokens
+def test_no_nudge_on_a_small_tail(make_engine):
+    engine = make_engine(context_length=1_000_000)
     counter = Counter()
     conversation: list[dict] = []
     for _ in range(2):
@@ -144,6 +145,19 @@ def test_no_nudge_below_floor(make_engine):
     engine.update_from_response({"prompt_tokens": 5_000})
     output = run_pass(engine, conversation)
     assert all(NUDGE_OPEN not in str(text) for text in user_texts(output))
+
+
+def test_huge_window_still_gets_reminded(make_engine):
+    """回归：分母是尾巴质量不是窗口——1M 窗口上的脏尾巴也必须够得着提醒。"""
+    engine = make_engine(context_length=1_000_000)
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(12):
+        conversation.extend(counter.big(size=120_000))
+        conversation.extend(counter.turn())
+    engine.update_from_response({"prompt_tokens": 300_000})   # 远低于 65% 阈值
+    output = run_pass(engine, conversation)
+    assert any(NUDGE_OPEN in str(t) for t in user_texts(output))
 
 
 def test_nudge_counters_recorded(make_engine):

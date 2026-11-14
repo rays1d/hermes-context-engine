@@ -28,7 +28,8 @@ from .estimate import (
     IMAGE_PART_TOKENS,
     args_string_bytes,
     content_fingerprint,
-    estimate_message_tokens,
+    estimate_reasoning_tokens,
+    estimate_tail_tokens,
 )
 
 FILE_PART_TYPES = frozenset({"image_url", "image", "file", "input_image"})
@@ -66,6 +67,8 @@ class ScanResult:
     roles: list[str] = field(default_factory=list)
     assistant_reasoning: list[bool] = field(default_factory=list)
     token_estimates: list[int] = field(default_factory=list)
+    # Per message, content + tool inputs only: the tail mass ``T`` the nudge measures.
+    tail_estimates: list[int] = field(default_factory=list)
 
 
 def parse_timestamp(value: Any) -> Optional[float]:
@@ -117,6 +120,7 @@ def scan_conversation(conversation: list[dict[str, Any]]) -> ScanResult:
             scan.roles.append("")
             scan.assistant_reasoning.append(False)
             scan.token_estimates.append(0)
+            scan.tail_estimates.append(0)
             continue
 
         identity, uid, content_hash = message_identity(msg)
@@ -128,7 +132,11 @@ def scan_conversation(conversation: list[dict[str, Any]]) -> ScanResult:
         role = str(msg.get("role") or "")
         scan.roles.append(role)
         scan.assistant_reasoning.append(bool(msg.get("reasoning_content")))
-        scan.token_estimates.append(estimate_message_tokens(msg))
+        # One walk per message: the tail figure is what the whole estimate is built on,
+        # so the nudge never has to re-tokenize the conversation on its own.
+        tail_tokens = estimate_tail_tokens(msg)
+        scan.tail_estimates.append(tail_tokens)
+        scan.token_estimates.append(tail_tokens + estimate_reasoning_tokens(msg))
 
         if role == "assistant":
             # Per-occurrence uid map: {provider call id: occurrence uid}. Provider ids

@@ -46,6 +46,57 @@ def find_tag_for(output, needle: str) -> int:
     raise AssertionError(f"no tool result containing {needle!r}")
 
 
+def test_idle_gap_never_permits_a_rebuild(make_engine):
+    """空闲超时不换重建：重发同样的字节不会让缓存变脏。"""
+    engine = make_engine(context_length=1_000_000)   # 2% 排队门槛 = 20k
+    counter = Counter()
+    conversation: list[dict] = []
+    conversation.extend(counter.turn())              # tag 1：小弧，远在保护窗口外
+    for _ in range(8):
+        conversation.extend(counter.big(size=120_000))
+    conversation.extend(counter.turn())
+    engine.update_from_response({"prompt_tokens": 30_000})
+    before = run_pass(engine, conversation)
+    target_tag = 1
+    payload = json.loads(engine.handle_tool_call(
+        "ctx_reduce", {"tags": str(target_tag)}, messages=conversation
+    ))
+    assert payload["stamped"] == [target_tag]
+
+    # 一天没说话：字节必须一点都不动（排队量远低于 2% 门槛）。
+    with engine._store.transaction() as conn:
+        engine._store.set_meta(conn, engine._session_id, "last_request_at", 0.0)
+    engine.update_from_response({"prompt_tokens": 31_000})
+    idle_pass = run_pass(engine, conversation)
+    assert fingerprint_list(idle_pass) == fingerprint_list(before)
+
+    # 真的到阈值才落地。
+    engine.update_from_response({"prompt_tokens": 700_000})
+    landed = run_pass(engine, conversation)
+    assert PLACEHOLDER.format(n=target_tag) in [m.get("content") for m in landed]
+
+
+def test_estimate_reading_permits_rebuild_without_usage(make_engine):
+    """没有 provider 用量时，上一趟请求的估算仍能顶开阈值。"""
+    engine = make_engine(context_length=200_000, threshold=1)
+    counter = Counter()
+    conversation: list[dict] = []
+    for _ in range(3):
+        conversation.extend(counter.turn())
+    conversation.extend(counter.big())
+    for _ in range(2):
+        conversation.extend(counter.turn())
+    conversation.extend(counter.big())
+    conversation.extend(counter.turn())
+    run_pass(engine, conversation)                  # 建下 last_est_total
+    target_tag = 1
+    assert json.loads(engine.handle_tool_call(
+        "ctx_reduce", {"tags": str(target_tag)}, messages=conversation
+    ))["stamped"] == [target_tag]
+    landed = run_pass(engine, conversation)          # 从未报告 prompt_tokens
+    assert PLACEHOLDER.format(n=target_tag) in [m.get("content") for m in landed]
+
+
 def test_ac1_fifty_turns_append_only(make_engine):
     engine = make_engine()
     counter = Counter()

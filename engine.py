@@ -62,29 +62,6 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
-def _env_duration(key: str, default: Optional[float]) -> Optional[float]:
-    """Seconds, or ``"5m"``/``"1h"`` style, or ``"never"``/``0`` for off."""
-    raw = os.environ.get(key)
-    if raw is None or not str(raw).strip():
-        return default
-    text = str(raw).strip().lower()
-    if text in {"never", "off", "0", "none"}:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        pass
-    units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
-    multiplier = units.get(text[-1:])
-    if multiplier:
-        try:
-            return float(text[:-1]) * multiplier
-        except ValueError:
-            pass
-    logger.warning("HCE config %s=%r is not a duration; using default %s", key, raw, default)
-    return default
-
-
 def _last_user_identity(scan: Any) -> Optional[str]:
     """Identity of the newest user message (the only place a fresh reminder may ride)."""
     for i in range(len(scan.roles) - 1, -1, -1):
@@ -104,7 +81,6 @@ class HermesContextEngine(ContextEngine):
 
     def __init__(self) -> None:
         self._enabled = _env_bool("HCE_ENABLED", True)
-        self._cache_ttl = _env_duration("HCE_CACHE_TTL", 300.0)
         self._threshold_pct = _env_float("HCE_EXECUTE_THRESHOLD", 65.0)
         self.threshold_percent = self._threshold_pct / 100.0
         self._store: Optional[Store] = None
@@ -272,17 +248,11 @@ class HermesContextEngine(ContextEngine):
                 )
                 protected = self._protected_tag_numbers(conn, scan, unit_tag_numbers)
                 pending = store.load_pending(conn, sid)
-                queued_tokens = 0
-                queued_count = 0
-                for p in pending:
-                    number = int(p["tag_number"])
-                    if number in protected:
-                        continue
-                    queued_tokens += self._tag_token(tag_rows, number)
-                    queued_count += 1
-                reasons = self._rebuild_reasons(
-                    conn, now, queued_tokens, queued_count, changed
+                queued_tokens, queued_count = self._queued_drop_tokens(
+                    conversation_messages, scan, unit_tag_numbers, tag_rows,
+                    pending, protected,
                 )
+                reasons = self._rebuild_reasons(conn, queued_tokens, queued_count, changed)
                 landed = False
                 if reasons:
                     landed = self._land_pending(
@@ -290,7 +260,8 @@ class HermesContextEngine(ContextEngine):
                         pending, protected, now,
                     )
                 nudge_text = self._nudge_for_pass(
-                    conn, scan, unit_tag_numbers, tag_rows, protected, landed
+                    conn, conversation_messages, scan, unit_tag_numbers, tag_rows,
+                    protected, landed,
                 )
                 markers = store.load_markers(conn, sid)
                 if reasons:
@@ -335,26 +306,100 @@ class HermesContextEngine(ContextEngine):
                 self._bump_safe("lkg_replays")
             return replayed
 
+    def _usage_percent(self, conn: Any) -> float:
+        """Context usage for the rebuild decision.
+
+        A provider reading always wins. When the provider reports none (or this is the
+        first pass of a session that has not been measured yet), the size of the
+        request this engine last served stands in: ``last_est_total`` is written on
+        every pass and priced with the same frozen ratio the rebuild gate uses.
+        Without this fallback a usage-less provider never crosses the threshold and
+        queued stamps can only land through ``compress()``.
+        """
+        ctx_len = int(self.context_length or 0)
+        if ctx_len <= 0:
+            return 0.0
+        if self.last_prompt_tokens > 0:
+            return self.last_prompt_tokens / ctx_len * 100.0
+        sid = self._session_id or ""
+        store = self._store
+        if store is None or not sid:
+            return 0.0
+        try:
+            served = int(store.get_meta_in_tx(conn, sid, "last_est_total", 0) or 0)
+        except Exception:
+            return 0.0
+        if served <= 0:
+            return 0.0
+        return served * self._estimate_ratio(conn) / ctx_len * 100.0
+
+    def _queued_drop_tokens(
+        self, conversation: list[dict[str, Any]], scan: Any,
+        unit_tag_numbers: dict[tuple, int], tag_rows: dict[int, dict[str, Any]],
+        pending: list[dict[str, Any]], protected: Optional[set[int]],
+    ) -> tuple[int, int]:
+        """Queued count and the tokens a landing pass would actually take off the wire.
+
+        The rebuild gate asks "is this pile worth a bust?", so it may only count mass
+        the drop can remove: every form leaves a placeholder behind, and a ``remove``
+        that lands as a skeleton (design 3.2) keeps the call's real arguments. Counting
+        raw ``token_count`` would let undroppable work justify a rebuild.
+        """
+        if not pending:
+            return 0, 0
+        number_to_unit: dict[int, Unit] = {}
+        for unit in scan.units:
+            number = unit_tag_numbers.get(
+                (unit.kind, unit.carrier_id, unit.call_id, unit.part_index)
+            )
+            if number is not None:
+                number_to_unit[number] = unit
+        placeholder_cost = len(PLACEHOLDER.format(n=0)) / 4.0
+        queued: list[tuple[Optional[Unit], int, str]] = []
+        for entry in pending:
+            number = int(entry["tag_number"])
+            if protected is not None and number in protected:
+                continue
+            row = tag_rows.get(number)
+            if row is None or row.get("status") != "active":
+                continue
+            unit = number_to_unit.get(number)
+            form = row.get("drop_form") or "skeleton"
+            if unit is not None and unit.kind == "file":
+                form = "placeholder"
+            elif unit is not None and form == "remove" \
+                    and self._removal_unsafe(unit, conversation):
+                form = "skeleton"
+            queued.append((unit, self._tag_token(tag_rows, number), form))
+        removed_carriers = {
+            unit.carrier_index for unit, _tokens, form in queued
+            if form == "remove" and unit is not None
+        }
+        total = 0.0
+        for unit, tokens, form in queued:
+            if unit is not None and unit.kind == "file" \
+                    and unit.carrier_index in removed_carriers:
+                continue  # already priced with the arc that takes it off the wire
+            total += float(tokens) if form == "remove" else max(tokens - placeholder_cost, 0.0)
+        return int(total), len(queued)
+
     def _rebuild_reasons(
-        self, conn: Any, now: float, queued_tokens: int, queued_count: int, changed: bool,
+        self, conn: Any, queued_tokens: int, queued_count: int, changed: bool,
     ) -> list[str]:
         """重建许可：每趟 pass 算一次，所有车道共享（不变式 5）。M0 触发器：
-        执行阈值、空闲超时、排队量占原始窗口 2%、连续第 3 趟挂住、对账变更。"""
+        执行阈值、排队量占够大、连续第 3 趟挂住、对账变更。
+
+        空闲超时**不是**触发器（设计 1.1 / 9.10）：重发同样的字节不会让 provider 忘掉缓存，
+        而重建会把模型还需要的上下文提前丢掉，并绕过它被承诺的阈值。
+        """
         sid = self._session_id or ""
         store = self._store
         assert store is not None
         reasons: list[str] = []
         ctx_len = int(self.context_length or 0)
-        usage_pct = (
-            self.last_prompt_tokens / ctx_len * 100.0
-            if ctx_len > 0 and self.last_prompt_tokens > 0 else 0.0
-        )
+        usage_pct = self._usage_percent(conn)
         if usage_pct >= self._threshold_pct:
             reasons.append(f"threshold({usage_pct:.1f}%)")
-        if self._cache_ttl is not None:
-            last_req = store.get_meta_in_tx(conn, sid, "last_request_at", None)
-            if last_req and (now - float(last_req)) >= self._cache_ttl:
-                reasons.append("idle")
         if queued_tokens > 0 and ctx_len > 0:
             ratio = self._estimate_ratio(conn)
             # 2% of the RAW window (not of usable): the gate is about "is this worth a
@@ -542,16 +587,44 @@ class HermesContextEngine(ContextEngine):
             landed = True
         return landed
 
+    def _tail_mass(
+        self, scan: Any,
+        unit_tag_numbers: dict[tuple, int], tag_rows: dict[int, dict[str, Any]],
+    ) -> int:
+        """``T``: the content mass of the tail the provider sees this pass.
+
+        Text, tool inputs/results and file parts count; reasoning and payloads that
+        already left the wire do not — a dropped result must stop inflating the
+        denominator, or every later pass reads calmer than it really is.
+        """
+        total = sum(scan.tail_estimates)
+        for unit in scan.units:
+            number = unit_tag_numbers.get(
+                (unit.kind, unit.carrier_id, unit.call_id, unit.part_index)
+            )
+            row = tag_rows.get(int(number)) if number is not None else None
+            if row is not None and row.get("status") != "active":
+                total -= int(unit.token_count)
+        return max(total, 0)
+
     def _nudge_for_pass(
-        self, conn: Any, scan: Any, unit_tag_numbers: dict[tuple, int],
-        tag_rows: dict[int, dict[str, Any]], protected: set[int], landed: bool,
+        self, conn: Any, conversation: list[dict[str, Any]], scan: Any,
+        unit_tag_numbers: dict[tuple, int], tag_rows: dict[int, dict[str, Any]],
+        protected: set[int], landed: bool,
     ) -> Optional[str]:
-        """Decide whether a reduction reminder rides this pass (tail-only bytes)."""
+        """Decide whether a reduction reminder rides this pass (tail-only bytes).
+
+        Pressure is U/T (design 4.3): ``T`` is what the tail actually carries and
+        ``U`` is the part of it that may be dropped. Anchoring to a percentage of the
+        *window* instead makes the reminder unreachable below the provider limit — on a
+        1M window the gentle band alone needed 130k reclaimable, more than a busy
+        session ever piles up.
+        """
         store = self._store
         sid = self._session_id or ""
         if store is None or not sid:
             return None
-        usable = int(self.context_length or 0) * (self._threshold_pct / 100.0)
+        tail = self._tail_mass(scan, unit_tag_numbers, tag_rows)
         count = 0
         tokens = 0
         oldest: list[tuple[int, Optional[str]]] = []
@@ -571,7 +644,7 @@ class HermesContextEngine(ContextEngine):
         decision = nudge_decide(
             reclaimable_tokens=tokens,
             reclaimable_count=count,
-            usable=usable,
+            tail_tokens=tail,
             oldest=oldest,
             last_fired_tokens=store.get_meta_in_tx(conn, sid, "nudge_fired_tokens", None),
             last_level=store.get_meta_in_tx(conn, sid, "nudge_level", None),

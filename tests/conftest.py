@@ -45,14 +45,11 @@ def make_engine(tmp_path, monkeypatch):
         session_id: str = "s1",
         context_length: int = 200_000,
         threshold: float | None = None,
-        cache_ttl: str | None = None,
         enabled: bool = True,
     ):
         monkeypatch.setenv("HCE_ENABLED", "1" if enabled else "0")
         if threshold is not None:
             monkeypatch.setenv("HCE_EXECUTE_THRESHOLD", str(threshold))
-        if cache_ttl is not None:
-            monkeypatch.setenv("HCE_CACHE_TTL", cache_ttl)
         from hce_plugin.engine import HermesContextEngine
 
         engine = HermesContextEngine()

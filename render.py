@@ -32,7 +32,7 @@ from .units import FILE_PART_TYPES, ScanResult, Unit
 PLACEHOLDER = "[dropped §{n}§]"
 TAG_PREFIX = "§{n}§"
 # Below this gap no marker is emitted at all: a 0m/1m marker on every quick exchange
-# is pure noise (and pure tokens). Matches magic-context's temporal threshold.
+# is pure noise (and pure tokens).
 MARKER_MIN_GAP_SECONDS = 300.0
 MAX_TOLERATED_CONTENT_DRIFT = 3
 

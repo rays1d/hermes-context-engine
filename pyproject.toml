@@ -1,6 +1,6 @@
 [project]
 name = "hermes-context-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cache-stable context engine plugin for Hermes Agent (magic-context lineage, memory-less)"
 requires-python = ">=3.11,<3.15"
 

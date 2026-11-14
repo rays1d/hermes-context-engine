@@ -129,10 +129,15 @@ def args_string_bytes(args: Any) -> int:
     return total
 
 
-def estimate_message_tokens(msg: dict[str, Any]) -> int:
-    """Estimate for one message as the provider sees it (content + tool_calls +
-    reasoning when replayed). Persistence-only fields are priced at zero because
-    they never reach the wire."""
+def estimate_tail_tokens(msg: dict[str, Any]) -> int:
+    """Estimate for one message's content and tool inputs — reasoning excluded.
+
+    The nudge measures tail mass (``T``) as what the agent could be asked to drop:
+    text, tool inputs and results, file parts. Reasoning and signatures are excluded
+    from both ``U`` and ``T`` in the design, because they are neither reclaimable nor
+    content the model chose to keep — counting them would inflate the denominator and
+    silently flatten every severity band.
+    """
     total = _content_tokens(msg.get("content"))
     calls = msg.get("tool_calls")
     if isinstance(calls, list):
@@ -141,10 +146,22 @@ def estimate_message_tokens(msg: dict[str, Any]) -> int:
             if isinstance(fn, dict):
                 total += _tool_args_tokens(fn.get("arguments")) + _TOOL_CALL_OVERHEAD_TOKENS
                 total += estimate_text_tokens(str(fn.get("name") or ""))
+    return total
+
+
+def estimate_reasoning_tokens(msg: dict[str, Any]) -> int:
+    """Tokens of the replayed reasoning on one message (0 when absent)."""
     reasoning = msg.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
-        total += estimate_text_tokens(reasoning)
-    return total
+        return estimate_text_tokens(reasoning)
+    return 0
+
+
+def estimate_message_tokens(msg: dict[str, Any]) -> int:
+    """Estimate for one message as the provider sees it (content + tool_calls +
+    reasoning when replayed). Persistence-only fields are priced at zero because
+    they never reach the wire."""
+    return estimate_tail_tokens(msg) + estimate_reasoning_tokens(msg)
 
 
 def content_fingerprint(msg: dict[str, Any]) -> str:
